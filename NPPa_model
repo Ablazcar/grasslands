@@ -1,0 +1,128 @@
+meteo<-meteo[order(meteo$fecha),] #ordenamos por si estuvieran desordenadas
+print(paste(aoi,'archivos meteorológicos cargados'))
+
+
+#conjunto de imágenes con las interpoladas
+NDVI_brick_interpoladas<-brick(paste('NDVI_interpoladas_',aoi,'.grd',sep=''))
+fechas<-data.frame(fecha=ymd(substr(names(NDVI_brick_interpoladas),5,12))) #extrae las fechas de imágenes disponibles
+indices<-1:nrow(fechas) #calcula los índices de las imágenes
+fechas_analisis<-fechas[fechas$fecha>=inicio&fechas$fecha<=fin,]
+indices_analisis<-indices[fechas$fecha%in%fechas_analisis]
+NDVI_brick_interpoladas<-subset(NDVI_brick_interpoladas,indices_analisis)
+print(paste(aoi,'imágenes cargadas'))
+
+
+#ajustamos las fechas de meteo e imágenes
+fechas<-data.frame(fecha=ymd(substr(names(NDVI_brick_interpoladas),5,12))) #Todas las fechas de la nueva selección de imágenes
+meteo<-merge(fechas,meteo,by='fecha',all.x=TRUE) #Recalcula meteo con todas las fechas, para incluir las lagunas como NA
+print(paste(aoi,'fechas ajustadas'))
+
+
+#interpolamos los valores que faltan en meteo
+meteo$TMin<-round(na_interpolation(meteo$TMin),1)
+meteo$TMed<-round(na_interpolation(meteo$TMed),1)
+meteo$HR<-round(na_interpolation(meteo$HR),1)
+meteo$Rad<-round(na_interpolation(meteo$Rad),1)
+print(paste(aoi,'meteo interpolado'))
+
+
+# ec. de presi?n de vapor en saturaci?n
+meteo$es<-(0.611*exp((17.27*meteo$TMed)/(237.3+meteo$TMed)))*10 
+# ec. presion de vapor ambiental
+meteo$eamb<-meteo$es*meteo$HR/100
+#en kPa
+meteo$DPV<-(meteo$es-meteo$eamb)/10
+
+#Se obtiene la Tmin escalar y la VPD escalar a partir de las restricciones 
+#de BPLUT y el epsilon máximo de la cubierta escogida:
+meteo$tminesc<-(meteo$TMin-tmin_min)/(tmin_max-tmin_min)
+if(length(meteo[meteo$tminesc<0,]$tminesc)>0) {meteo[meteo$tminesc<0,]$tminesc<-0}
+if(length(meteo[meteo$tminesc>1,]$tminesc)>0) {meteo[meteo$tminesc>1,]$tminesc<-1}
+meteo$VPDesc<-1+((vpd_min-meteo$DPV)/(vpd_max-vpd_min))
+if(length(meteo[meteo$VPDesc<0,]$VPDesc)>0){meteo[meteo$VPDesc<0,]$VPDesc<-0}
+if(length(meteo[meteo$VPDesc>1,]$VPDesc)>0){meteo[meteo$VPDesc>1,]$VPDesc<-1}
+
+#obtención de epsilon
+meteo$epsilon<-emax*meteo$tminesc*meteo$VPDesc
+meteo$epsilong<-0.86*meteo$tminesc*meteo$VPDesc
+
+#obtención?n de PAR a partir de la radiación
+meteo$PAR<-0.48*meteo$Rad
+
+#exportamos la tabla meteo
+write.csv(meteo,file=paste('meteo',aoi,'.csv',sep=''))
+
+
+#matriz para reclasificar fpar y NPP
+reclass_0<-matrix(c(-Inf,0,0),ncol=3) #matriz para reclasificar todos los valores 
+                                      #entre -Inf y 0 haci?ndolos iguales a 0
+
+
+for (i in 1:nlayers(NDVI_brick_interpoladas)){
+        imagen<-raster(NDVI_brick_interpoladas,layer=i)
+        year<-substr(names(imagen),5,8)
+        if (file_test('-f',paste('verano/verano',year,aoi,'.tif',sep=''))==FALSE){ #Cuando no existe la imagen de verano
+        base<-raster(paste('verano/verano',as.integer(year)-1,aoi,'.tif',sep=''))} #Se coge la del año anterior
+        else{base<-raster(paste('verano/verano',year,aoi,'.tif',sep=''))}  #Cuando sí que existe imagen de verano
+        ajustada<-imagen-base   
+        fpar<-1.26*ajustada-0.19
+         fpar<-reclassify(fpar,reclass_0)  #ajusta a 0 los valores de fpar negativos
+        if(i==1){fpar_brick<-brick(fpar)
+                names(fpar_brick)[i]<-paste('fpar_',names(imagen),sep='')} 
+        else{fpar_brick<-addLayer(fpar_brick,fpar)  #Lo transforma en stack pero como brick es mucho mÃ¡s lento
+                names(fpar_brick)[i]<-paste('fpar_',names(imagen),sep='')}
+        NPP<-10*fpar*meteo$PAR[i]*meteo$epsilon[i]
+        NPP<-reclassify(NPP,reclass_0)  #ajusta a 0 los valores de NPP negativos          
+        if(i==1){NPP_brick<-brick(NPP)
+                names(NPP_brick)[i]<-paste('NPP_',names(imagen),sep='')
+                acumulado<-reclassify(NPP,matrix(c(-Inf,0,0),ncol=3))
+                NPPa_brick<-brick(acumulado)
+                names(NPPa_brick)[i]<-paste('NPPa_',names(imagen),sep='')
+                } 
+        else{NPP_brick<-addLayer(NPP_brick,NPP)
+                names(NPP_brick)[i]<-paste('NPP_',names(imagen),sep='')
+                acumulado<-reclassify(acumulado,matrix(c(-Inf,0,0),ncol=3))
+                if (substr(names(imagen),9,12)=='0831'){acumulado<-acumulado*0}else{acumulado<-acumulado+NPP}
+                NPPa_brick<-addLayer(NPPa_brick,acumulado)
+                names(NPPa_brick)[i]<-paste('NPPa_',names(imagen),sep='')
+                }
+        print(paste('layer ',i,' over ',nlayers(NDVI_brick_interpoladas),'  ',round(i*100/nlayers(NDVI_brick_interpoladas),2),'%',sep=''))
+}
+
+#Sufijo del epsilon máximo
+semax<-substr(emax*100+1000,2,4)
+
+#SE ALMACENAN TODOS LOS BRICK        
+directorio<-paste('biomasa/B',
+                 format(max(fechas_analisis), "%y%m%d"),
+                 '_emax',semax,
+                 sep='')
+dir.create(directorio,recursive=TRUE)
+
+
+
+writeRaster(fpar_brick, 
+            filename=paste(directorio,'/fpar_',aoi,'_emax',semax,'.grd',sep=''), 
+            format="raster", 
+            overwrite=TRUE)
+writeRaster(NPP_brick, 
+            filename=paste(directorio,'/NPP_',aoi,'_emax',semax,'.grd',sep=''), 
+            format="raster", 
+            overwrite=TRUE)
+writeRaster(NPPa_brick, 
+            filename=paste(directorio,'/NPPa_',aoi,'_emax',semax,'.grd',sep=''), 
+            format="raster", 
+            overwrite=TRUE)
+
+
+
+#ESTAD?STICAS ZONALES
+poly<-readOGR(paste('coberturas/',aoi,'_zonas.shp',sep=''))  #Se carga la cobertura
+poly<-spTransform(x = poly, #Se le asigna la proyección de temp, que es fija según llega de google engine
+                  CRSobj = '+proj=utm +zone=30 +datum=WGS84 +units=m +no_defs +ellps=WGS84 +towgs84=0,0,0 ')
+NPPa_mean <- extract(NPPa_brick, poly, fun='mean', na.rm=TRUE, df=FALSE, weights = TRUE) 
+NPPa_mean<-data.frame(t(NPPa_mean))  #transponemos el dataframe
+colnames(NPPa_mean)<-paste(poly$ID_ZONA,'_',semax,sep='')
+NPPa_mean<-data.frame(NPPa_mean,fecha=ymd(substr(rownames(NPPa_mean),10,17)))
+
+write.csv(NPPa_mean,paste(directorio,'/NPPa_mean_',aoi,'.csv',sep=''))
